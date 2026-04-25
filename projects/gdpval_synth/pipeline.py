@@ -103,6 +103,11 @@ def _rule_judger(ws: str) -> Judger:
                     {"base": str(WRAPPERS / "gdpval_synth"),
                      "source": "rule_judge*", "target": f"{root}/"},
                 ]),
+                # rubric + spec 被 infer 阶段排除了，judger 单独上传
+                UploadHook([
+                    {"source": "rubric.json", "target": f"{ws}/"},
+                    {"source": "deliverable_spec.json", "target": f"{ws}/"},
+                ]),
             ],
             entry=f"bash {root}/rule_judge_wrap.sh",
             env={
@@ -133,6 +138,11 @@ def _simple_judger(ws: str) -> Judger:
                     {"base": str(WRAPPERS / "gdpval_synth"),
                      "source": "simple_judge*", "target": f"{root}/"},
                 ]),
+                # rubric + spec 被 infer 阶段排除了，judger 单独上传
+                UploadHook([
+                    {"source": "rubric.json", "target": f"{ws}/"},
+                    {"source": "deliverable_spec.json", "target": f"{ws}/"},
+                ]),
             ],
             entry=f"bash {root}/simple_judge_wrap.sh",
             env={
@@ -141,6 +151,9 @@ def _simple_judger(ws: str) -> Judger:
                 "TASK_JUDGER_DIR": root,
                 "RUBRIC_PATH": f"{ws}/rubric.json",
                 "DELIVERABLE_SPEC_PATH": f"{ws}/deliverable_spec.json",
+                "JUDGE_MODEL_BASE_URL": "${JUDGE_MODEL_BASE_URL}",
+                "JUDGE_MODEL_API_KEY": "${JUDGE_MODEL_API_KEY}",
+                "JUDGE_MODEL_NAME": "${JUDGE_MODEL_NAME}",
             },
             timeout=600,
             post=[ParseJudgerStdout("simple_judger")],
@@ -176,10 +189,11 @@ def gdpval_synth_pipeline(
             # 3. Weighted-pick one agent; record choice + template_root in ctx.
             PickAgent(agents=agents, template_root=str(AGENT_TEMPLATES)),
             # 4. Mirror task tree into workspace.  Exclude metadata + deliverable
-            #    fixture files the agent should not see.
+            #    fixture files and judger config the agent should not see.
             UploadHook([
                 {"source": "**/*", "target": f"{ws}/",
-                 "exclude": ["metadata.json", "deliverable_files/**"]},
+                 "exclude": ["metadata.json", "deliverable_files/**",
+                             "rubric.json", "deliverable_spec.json"]},
             ]),
             # 5. Overlay chosen agent's template at workspace/agent/<name>/.
             UploadChosenAgent(target_dir=f"{ws}/agent/"),

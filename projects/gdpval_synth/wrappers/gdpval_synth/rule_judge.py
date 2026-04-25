@@ -1,315 +1,357 @@
-"""Rule-based judger for gdpval_synth Agent Rollout.
+"""Rule-based criterion verification for GDPVal Synth.
 
-Reads rubric.json and deliverable_spec.json, filters criteria with
-judge_method == "rule", and checks whether the agent produced correct
-output files.  Outputs a single JSON line to stdout.
+Can be used as a standalone script or imported as a module.
+
+Standalone usage:
+    TASK_WORKSPACE=/path/to/task \
+    RUBRIC_PATH=/path/to/rubric.json \
+    DELIVERABLE_SPEC_PATH=/path/to/spec.json \
+    JUDGER_NAME=rule_judge \
+    python rule_judge.py
+
+Output: JudgerResult JSON to stdout.
 """
-
 from __future__ import annotations
 
 import json
 import os
 import re
 import sys
-from pathlib import Path
+from dataclasses import dataclass
 
-# ---------------------------------------------------------------------------
-# Logging helper (all logs to stderr so stdout stays clean for JSON output)
-# ---------------------------------------------------------------------------
-
-def _log(msg: str) -> None:
-    print(f"[rule_judge] {msg}", file=sys.stderr)
+import openpyxl
+import pdfplumber
+from docx import Document as DocxDocument
+from pptx import Presentation
 
 
-# ---------------------------------------------------------------------------
-# File-checking helpers
-# ---------------------------------------------------------------------------
+# ─── Expected field parsers ──────────────────────────────────────────────────
 
-def _resolve_file(workspace: Path, spec_filename: str) -> Path | None:
-    """Try full relative path first, then basename-only fallback."""
-    candidate = workspace / spec_filename
-    if candidate.exists():
-        return candidate
-    candidate = workspace / Path(spec_filename).name
-    if candidate.exists():
-        return candidate
+_FILENAME_RE = re.compile(r"[\w\-]+\.(?:xlsx|xls|xlsm|pdf|docx|doc|pptx|ppt)")
+
+
+def parse_expected_filenames(expected: str) -> list[str]:
+    """Extract filenames from expected text."""
+    # Pattern 1: Files: ['a.xlsx', 'b.pdf']
+    m = re.search(r"Files:\s*\[([^\]]+)\]", expected)
+    if m:
+        items = re.findall(r"'([^']+)'", m.group(1))
+        return [i for i in items if "." in i]
+
+    # Pattern 2: File named 'xxx.xlsx'
+    m = re.search(r"[Ff]ile\s+named?\s+'([^']+)'", expected)
+    if m:
+        names = [m.group(1)]
+        rest = expected[m.end():]
+        more = _FILENAME_RE.findall(rest)
+        names.extend(more)
+        return list(dict.fromkeys(names))
+
+    # Pattern 3: general filename scan
+    all_fnames = _FILENAME_RE.findall(expected)
+    if all_fnames:
+        return list(dict.fromkeys(all_fnames))
+
+    return []
+
+
+def parse_expected_sheets(expected: str) -> list[str]:
+    """Extract sheet names from expected text."""
+    sheets = []
+    # Pattern 1: sheets named 'X' (and 'Y' ...)
+    for m in re.finditer(r"(?:sheet|sheets|worksheet|tab)s?\s+named\s+'([^']+)'((?:\s+and\s+'[^']+')*)", expected, re.IGNORECASE):
+        sheets.append(m.group(1))
+        if m.group(2):
+            sheets.extend(re.findall(r"'([^']+)'", m.group(2)))
+    # Pattern 2: 'X' and 'Y' sheets
+    m = re.search(r"'([^']+)'(?:\s+and\s+'([^']+)')?\s+sheets", expected, re.IGNORECASE)
+    if m:
+        sheets.append(m.group(1))
+        if m.group(2):
+            sheets.append(m.group(2))
+    # Pattern 3: A sheet named 'X'
+    for m in re.finditer(r"[Aa]\s+sheet\s+named\s+'([^']+)'", expected):
+        sheets.append(m.group(1))
+
+    return list(dict.fromkeys(sheets))
+
+
+def parse_expected_columns(expected: str) -> list[str]:
+    """Extract column names from expected text."""
+    _COL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_ ]*[A-Za-z0-9_]$|^[A-Za-z_]$")
+
+    # Pattern 1: [Excel ]columns[: order](X, Y, Z)
+    m = re.search(r"(?:Excel\s+)?columns?(?:\s+order)?[\s:(\[]+([A-Za-z_][\w,\s]+?)(?:\)|;|\]|$)", expected)
+    if m:
+        raw = m.group(1)
+        cols = [c.strip() for c in raw.split(",") if c.strip()]
+        cols = [c for c in cols if _COL_RE.match(c)]
+        if cols:
+            return cols
+
+    # Pattern 2: contains columns: X, Y, Z
+    m = re.search(r"contains?\s+columns?[\s:]+([A-Za-z_][\w,\s]+?)(?:\.|;|$)", expected)
+    if m:
+        raw = m.group(1)
+        cols = [c.strip() for c in raw.split(",") if c.strip()]
+        cols = [c for c in cols if _COL_RE.match(c)]
+        if cols:
+            return cols
+
+    return []
+
+
+def parse_expected_sections(expected: str) -> list[str]:
+    """Extract document section names from expected text."""
+    # Pattern 1: PDF Sections: ['X', 'Y', 'Z']
+    m = re.search(r"[Ss]ections?:\s*\[([^\]]+)\]", expected)
+    if m:
+        return [s.strip().strip("'\"") for s in m.group(1).split(",") if s.strip()]
+
+    # Pattern 2: sections: X, Y, Z
+    m = re.search(r"(?:following\s+)?(?:\w+\s+)?sections?:\s*(.+?)(?:\.|;|$)", expected, re.IGNORECASE)
+    if m:
+        raw = m.group(1).strip()
+        parts = re.split(r",\s*(?:and\s+)?", raw)
+        parts = [p.strip().strip("'\"") for p in parts if p.strip()]
+        parts = [p for p in parts if len(p) > 2 and "=" not in p]
+        if parts:
+            return parts
+
+    return []
+
+
+# ─── Dataclass ───────────────────────────────────────────────────────────────
+
+@dataclass
+class Criterion:
+    criterion_id: str
+    criterion_type: str
+    weight: int
+    description: str
+    expected: str
+
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _normalize_name(s: str) -> str:
+    """Normalize name for fuzzy matching: lowercase, strip, underscores/hyphens to spaces, collapse whitespace."""
+    s = s.lower().strip()
+    s = s.replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", s)
+
+
+def _to_str(val) -> str:
+    """Convert expected field to string (may be list / float / int)."""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list):
+        return ", ".join(str(v) for v in val)
+    return str(val)
+
+
+def extract_file_meta(filepath: str) -> dict:
+    """Extract structured file metadata."""
+    meta: dict = {
+        "filename": os.path.basename(filepath),
+        "ext": os.path.splitext(filepath)[1].lower(),
+        "size_bytes": os.path.getsize(filepath),
+    }
+    ext = meta["ext"]
+    try:
+        if ext in (".xlsx", ".xls", ".xlsm"):
+            wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+            meta["sheet_names"] = wb.sheetnames
+            meta["headers"] = {}
+            meta["row_counts"] = {}
+            for name in wb.sheetnames:
+                ws = wb[name]
+                rows = list(ws.iter_rows(max_row=1, values_only=True))
+                meta["headers"][name] = [str(c) if c is not None else "" for c in rows[0]] if rows else []
+                meta["row_counts"][name] = ws.max_row or 0
+            wb.close()
+        elif ext == ".pdf":
+            with pdfplumber.open(filepath) as pdf:
+                meta["page_count"] = len(pdf.pages)
+        elif ext in (".docx", ".doc"):
+            doc = DocxDocument(filepath)
+            meta["headings"] = [p.text for p in doc.paragraphs if p.style.name.startswith("Heading")]
+            meta["paragraph_count"] = len(doc.paragraphs)
+            meta["table_count"] = len(doc.tables)
+        elif ext in (".pptx", ".ppt"):
+            prs = Presentation(filepath)
+            meta["slide_count"] = len(prs.slides)
+    except Exception as e:
+        meta["parse_error"] = str(e)
+    return meta
+
+
+def try_rule_verify(
+    criterion: Criterion,
+    deliverables: list[str],
+    all_meta: list[dict],
+) -> dict | None:
+    """Try to verify a criterion using rules. Returns result dict or None."""
+    exp = criterion.expected
+
+    # ── file existence ──
+    filenames = parse_expected_filenames(exp)
+    if filenames:
+        found = {os.path.basename(f) for f in deliverables}
+        missing = [fn for fn in filenames if fn not in found]
+        if not missing:
+            return {"satisfied": True, "evidence": f"All files found: {filenames}", "reason": "rule:file_exists"}
+        else:
+            return {"satisfied": False, "evidence": f"Missing files: {missing}", "reason": "rule:file_exists"}
+
+    # ── sheet name existence ──
+    sheets = parse_expected_sheets(exp)
+    if sheets:
+        all_sheets = set()
+        for m in all_meta:
+            all_sheets.update(_normalize_name(s) for s in m.get("sheet_names", []))
+        missing = [s for s in sheets if _normalize_name(s) not in all_sheets]
+        if not missing:
+            return {"satisfied": True, "evidence": f"Sheets found: {sheets}", "reason": "rule:sheet_exists"}
+        elif all_sheets:
+            return {"satisfied": False, "evidence": f"Missing sheets: {missing}", "reason": "rule:sheet_exists"}
+
+    # ── column name existence ──
+    columns = parse_expected_columns(exp)
+    if columns:
+        all_headers = set()
+        for m in all_meta:
+            for hdrs in m.get("headers", {}).values():
+                all_headers.update(_normalize_name(h) for h in hdrs if h)
+        missing = [c for c in columns if _normalize_name(c) not in all_headers]
+        if not missing:
+            return {"satisfied": True, "evidence": f"All columns found", "reason": "rule:column_exists"}
+        elif all_headers:
+            return {"satisfied": False, "evidence": f"Missing columns: {missing}", "reason": "rule:column_exists"}
+
+    # ── docx section existence ──
+    sections = parse_expected_sections(exp)
+    if sections:
+        all_headings = set()
+        for m in all_meta:
+            all_headings.update(_normalize_name(h) for h in m.get("headings", []))
+        if all_headings:
+            missing_sections = [s for s in sections if _normalize_name(s) not in all_headings]
+            if not missing_sections:
+                return {"satisfied": True, "evidence": f"Sections found: {sections}", "reason": "rule:section_exists"}
+            else:
+                return {"satisfied": False, "evidence": f"Missing sections: {missing_sections}", "reason": "rule:section_exists"}
+
     return None
 
 
-def _check_excel_sheets(filepath: Path, expected_sheets: list[str]) -> tuple[int, int]:
-    """Return (found, total) for expected sheet names in an xlsx file."""
-    try:
-        import openpyxl
-        wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
-        actual = {s.lower().strip() for s in wb.sheetnames}
-        wb.close()
-    except Exception as exc:
-        _log(f"openpyxl error reading {filepath}: {exc}")
-        return 0, len(expected_sheets)
+# ─── Standalone main ─────────────────────────────────────────────────────────
 
-    found = sum(1 for s in expected_sheets if s.lower().strip() in actual)
-    return found, len(expected_sheets)
-
-
-def _check_docx_sections(filepath: Path, expected_sections: list[str]) -> tuple[int, int]:
-    """Return (found, total) for expected headings/sections in a docx file."""
-    try:
-        import docx
-        doc = docx.Document(str(filepath))
-        headings = set()
-        for para in doc.paragraphs:
-            if para.style and para.style.name and para.style.name.startswith("Heading"):
-                headings.add(para.text.lower().strip())
-            # Also check bold-only paragraphs as pseudo-headings
-            elif para.runs and all(r.bold for r in para.runs if r.text.strip()):
-                headings.add(para.text.lower().strip())
-    except Exception as exc:
-        _log(f"python-docx error reading {filepath}: {exc}")
-        return 0, len(expected_sections)
-
-    found = sum(1 for s in expected_sections if s.lower().strip() in headings)
-    return found, len(expected_sections)
+def _scan_deliverables(task_dir: str) -> list[str]:
+    """Scan task_dir for deliverable file paths."""
+    deliverables: list[str] = []
+    extensions = (".xlsx", ".xls", ".xlsm", ".pdf", ".pptx", ".ppt", ".docx", ".doc")
+    for subdir in ("home/workspace", "home", "deliverable_files"):
+        candidate = os.path.join(task_dir, subdir)
+        if os.path.isdir(candidate):
+            for root, _, files in os.walk(candidate):
+                for fname in files:
+                    if fname.lower().endswith(extensions):
+                        deliverables.append(os.path.join(root, fname))
+            if deliverables:
+                break
+    return deliverables
 
 
-# ---------------------------------------------------------------------------
-# Parse the "expected" field for completeness criteria
-# ---------------------------------------------------------------------------
+def main():
+    """Standalone entry point. Reads env vars and outputs JudgerResult JSON."""
+    task_workspace = os.environ.get("TASK_WORKSPACE", "")
+    rubric_path = os.environ.get("RUBRIC_PATH", "")
+    deliverable_spec_path = os.environ.get("DELIVERABLE_SPEC_PATH", "")
+    judger_name = os.environ.get("JUDGER_NAME", "rule_judge")
 
-def _parse_expected(expected: str) -> tuple[list[str], list[str]]:
-    """Parse expected field like 'Excel sheets: A, B, C; DOCX sections: X, Y, Z'.
+    assert task_workspace, "TASK_WORKSPACE env var is required"
+    assert rubric_path, "RUBRIC_PATH env var is required"
 
-    Returns (excel_sheets, docx_sections).
-    """
-    excel_sheets: list[str] = []
-    docx_sections: list[str] = []
+    # Load rubric
+    with open(rubric_path) as f:
+        rubric_data = json.load(f)
 
-    # Split on semicolons
-    parts = [p.strip() for p in expected.split(";")]
-    for part in parts:
-        lower = part.lower()
-        if lower.startswith("excel sheets:") or lower.startswith("excel sheet:"):
-            items_str = part.split(":", 1)[1].strip()
-            excel_sheets = [s.strip() for s in items_str.split(",") if s.strip()]
-        elif lower.startswith("docx sections:") or lower.startswith("docx section:"):
-            items_str = part.split(":", 1)[1].strip()
-            docx_sections = [s.strip() for s in items_str.split(",") if s.strip()]
-
-    return excel_sheets, docx_sections
-
-
-# ---------------------------------------------------------------------------
-# Build a lookup from deliverable_spec
-# ---------------------------------------------------------------------------
-
-def _build_spec_lookup(spec: list[dict]) -> dict[str, dict]:
-    """Map filename -> spec entry, also keyed by basename."""
-    lookup: dict[str, dict] = {}
-    for entry in spec:
-        fn = entry.get("filename", "")
-        lookup[fn] = entry
-        lookup[Path(fn).name] = entry
-    return lookup
-
-
-# ---------------------------------------------------------------------------
-# Per-criterion judge functions
-# ---------------------------------------------------------------------------
-
-def _judge_completeness(
-    criterion: dict,
-    workspace: Path,
-    spec: list[dict],
-    spec_lookup: dict[str, dict],
-) -> float:
-    """Check file existence, Excel sheets, DOCX sections."""
-    expected_str = criterion.get("expected", "")
-    excel_sheets, docx_sections = _parse_expected(expected_str)
-
-    total_checks = 0
-    passed_checks = 0
-
-    # Check file existence for all deliverables
-    for entry in spec:
-        fn = entry.get("filename", "")
-        total_checks += 1
-        resolved = _resolve_file(workspace, fn)
-        if resolved is not None:
-            passed_checks += 1
-        else:
-            _log(f"  missing file: {fn}")
-
-    # Check excel sheets
-    if excel_sheets:
-        # Find xlsx files in spec
-        xlsx_files = [e for e in spec if e.get("type") == "xlsx"]
-        for xlsx_entry in xlsx_files:
-            resolved = _resolve_file(workspace, xlsx_entry.get("filename", ""))
-            if resolved is not None:
-                found, total = _check_excel_sheets(resolved, excel_sheets)
-                total_checks += total
-                passed_checks += found
-                if found < total:
-                    _log(f"  xlsx {resolved.name}: {found}/{total} expected sheets found")
-            else:
-                total_checks += len(excel_sheets)
-
-    # Check docx sections
-    if docx_sections:
-        docx_files = [e for e in spec if e.get("type") == "docx"]
-        for docx_entry in docx_files:
-            resolved = _resolve_file(workspace, docx_entry.get("filename", ""))
-            if resolved is not None:
-                found, total = _check_docx_sections(resolved, docx_sections)
-                total_checks += total
-                passed_checks += found
-                if found < total:
-                    _log(f"  docx {resolved.name}: {found}/{total} expected sections found")
-            else:
-                total_checks += len(docx_sections)
-
-    if total_checks == 0:
-        return 1.0
-    return passed_checks / total_checks
-
-
-def _judge_format_compliance(
-    criterion: dict,
-    workspace: Path,
-    spec: list[dict],
-    spec_lookup: dict[str, dict],
-) -> float:
-    """Check file existence and correct extension."""
-    total_checks = 0
-    passed_checks = 0
-
-    for entry in spec:
-        fn = entry.get("filename", "")
-        expected_type = entry.get("type", "")
-
-        # Existence check
-        total_checks += 1
-        resolved = _resolve_file(workspace, fn)
-        if resolved is not None:
-            passed_checks += 1
-        else:
-            _log(f"  missing file: {fn}")
-            # Extension check still counts but fails
-            if expected_type:
-                total_checks += 1
-            continue
-
-        # Extension check
-        if expected_type:
-            total_checks += 1
-            actual_ext = resolved.suffix.lstrip(".").lower()
-            if actual_ext == expected_type.lower():
-                passed_checks += 1
-            else:
-                _log(f"  wrong extension: {resolved.name} expected .{expected_type}")
-
-    if total_checks == 0:
-        return 1.0
-    return passed_checks / total_checks
-
-
-def _judge_accuracy_rule(
-    criterion: dict,
-    workspace: Path,
-    spec: list[dict],
-    spec_lookup: dict[str, dict],
-) -> float:
-    """Default accuracy rule: file existence check."""
-    if not spec:
-        return 1.0
-    found = 0
-    for entry in spec:
-        fn = entry.get("filename", "")
-        if _resolve_file(workspace, fn) is not None:
-            found += 1
-    return found / len(spec)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    workspace_str = os.environ.get("TASK_WORKSPACE", "")
-    rubric_path_str = os.environ.get("RUBRIC_PATH", "")
-    spec_path_str = os.environ.get("DELIVERABLE_SPEC_PATH", "")
-    judger_name = os.environ.get("JUDGER_NAME", "rule_judger")
-
-    if not workspace_str:
-        print(json.dumps({"judger_name": judger_name, "total": 0.0, "error": "TASK_WORKSPACE not set"}))
-        return
-
-    workspace = Path(workspace_str)
-
-    # Read rubric
-    rubric_path = Path(rubric_path_str) if rubric_path_str else workspace / "rubric.json"
-    try:
-        rubric = json.loads(rubric_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        print(json.dumps({"judger_name": judger_name, "total": 0.0, "error": f"Cannot read rubric: {exc}"}))
-        return
-
-    # Read deliverable spec
-    spec_path = Path(spec_path_str) if spec_path_str else workspace / "deliverable_spec.json"
-    try:
-        spec = json.loads(spec_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        _log(f"Cannot read deliverable_spec: {exc}, using empty spec")
-        spec = []
-
-    spec_lookup = _build_spec_lookup(spec)
+    raw_criteria = rubric_data.get("criteria", [])
+    assert raw_criteria, f"No criteria found in rubric: {rubric_path}"
 
     # Filter rule criteria
-    all_criteria = rubric.get("criteria", [])
-    rule_criteria = [c for c in all_criteria if c.get("judge_method") == "rule"]
-
+    rule_criteria = [c for c in raw_criteria if c.get("judge_method") == "rule"]
     if not rule_criteria:
-        print(json.dumps({
+        # No rule criteria, output empty result
+        result = {
             "judger_name": judger_name,
-            "total": 1.0,
-            "criteria": {},
-            "metadata": {"skipped": True},
-        }))
+            "criteria_results": [],
+            "summary": {"total": 0, "satisfied": 0, "not_satisfied": 0, "undetermined": 0},
+        }
+        print(json.dumps(result, ensure_ascii=False))
         return
 
-    _log(f"Found {len(rule_criteria)} rule criteria out of {len(all_criteria)} total")
+    # Scan deliverables
+    deliverables = _scan_deliverables(task_workspace)
 
-    # Judge each criterion
-    criteria_results: dict[str, dict] = {}
-    judge_funcs = {
-        "completeness": _judge_completeness,
-        "format_compliance": _judge_format_compliance,
-    }
+    # Extract file metadata
+    all_meta: list[dict] = []
+    for fpath in deliverables:
+        try:
+            all_meta.append(extract_file_meta(fpath))
+        except Exception as e:
+            all_meta.append({
+                "filename": os.path.basename(fpath),
+                "ext": os.path.splitext(fpath)[1],
+                "parse_error": str(e),
+            })
 
-    for criterion in rule_criteria:
-        cid = criterion.get("criterion_id", "unknown")
-        ctype = criterion.get("criterion_type", "")
-        weight = float(criterion.get("weight", 1.0))
+    # Run rule verification for each criterion
+    criteria_results = []
+    satisfied_count = 0
+    not_satisfied_count = 0
+    undetermined_count = 0
 
-        judge_fn = judge_funcs.get(ctype, _judge_accuracy_rule)
-        score = judge_fn(criterion, workspace, spec, spec_lookup)
+    for i, c in enumerate(rule_criteria):
+        criterion = Criterion(
+            criterion_id=c.get("criterion_id", f"c_{i}"),
+            criterion_type=c.get("criterion_type", "unknown"),
+            weight=c.get("weight", 1),
+            description=_to_str(c.get("description", "")),
+            expected=_to_str(c.get("expected", "")),
+        )
+        rule_result = try_rule_verify(criterion, deliverables, all_meta)
 
-        criteria_results[cid] = {"score": round(score, 4), "weight": weight}
-        _log(f"  {cid} ({ctype}): score={score:.4f}, weight={weight}")
+        if rule_result is not None:
+            score = 1.0 if rule_result["satisfied"] else 0.0
+            if rule_result["satisfied"]:
+                satisfied_count += 1
+            else:
+                not_satisfied_count += 1
+        else:
+            score = -1.0  # undetermined, needs simple_judge
+            undetermined_count += 1
+            rule_result = {"satisfied": None, "evidence": "", "reason": "rule:no_match"}
 
-    # Compute weighted total
-    total_weight = sum(r["weight"] for r in criteria_results.values())
-    if total_weight > 0:
-        total_score = sum(r["score"] * r["weight"] for r in criteria_results.values()) / total_weight
-    else:
-        total_score = 0.0
+        criteria_results.append({
+            "criterion_id": criterion.criterion_id,
+            "score": score,
+            "satisfied": rule_result["satisfied"],
+            "evidence": rule_result.get("evidence", ""),
+            "reason": rule_result.get("reason", ""),
+        })
 
     result = {
         "judger_name": judger_name,
-        "total": round(total_score, 4),
-        "criteria": criteria_results,
-        "metadata": {"rule_criteria_count": len(rule_criteria)},
+        "criteria_results": criteria_results,
+        "summary": {
+            "total": len(rule_criteria),
+            "satisfied": satisfied_count,
+            "not_satisfied": not_satisfied_count,
+            "undetermined": undetermined_count,
+        },
     }
-
     print(json.dumps(result, ensure_ascii=False))
 
 

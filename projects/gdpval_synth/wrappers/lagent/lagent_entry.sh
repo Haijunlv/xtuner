@@ -58,14 +58,16 @@ nohup "$LAGENT_PY" -m lagent.serving.sandbox.daemon start \
     --mode agent \
     --config "$CONFIG" \
     --sock "$SOCK" \
-    >>"$" 2>&1 &
+    >>"$LOG" 2>&1 &
 DAEMON_PID=$!
 
 for _ in $(seq 1 60); do
     [ -S "$SOCK" ] && break
     if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
         echo "daemon died before socket came up" >&2
-        tail -n 100 "$LOG" >&2 || true
+        echo "=== daemon log ===" >&2
+        cat "$LOG" >&2 || true
+        echo "=== end daemon log ===" >&2
         exit 4
     fi
     sleep 1
