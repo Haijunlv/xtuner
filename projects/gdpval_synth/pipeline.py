@@ -25,6 +25,7 @@ from xtuner.v1.ray.environment.rl_task.runner import Runner
 from xtuner.v1.ray.environment.rl_task.sandbox import (
     DownloadHook,
     ExecHook,
+    ReadFileHook,
     SandboxStage,
     UploadHook,
 )
@@ -46,6 +47,7 @@ PATHS = SimpleNamespace(
     wrappers_lagent="/tmp/wrappers/lagent",
     agent_config="/tmp/agent_config.json",
     trajectory="/tmp/trajectory.json",
+    message="/tmp/message.json",
     verifier="/tmp/verifier",
 )
 
@@ -60,7 +62,8 @@ AGENT_ENTRY = (
     f"--config {PATHS.agent_config} "
     f"--instruction-file $TASK_INSTRUCTION "
     f"--response-out /tmp/agent_response.txt "
-    f"--trajectory-out {PATHS.trajectory}"
+    f"--trajectory-out {PATHS.trajectory} "
+    f"--message-out {PATHS.message}"
 )
 
 
@@ -205,9 +208,15 @@ def gdpval_synth_pipeline(
             RunAgentInstallDeps(workspace=ws),
         ],
         entry=AGENT_ENTRY,
-        env=BenchEnv(workspace=ws),
+        env=BenchEnv(
+            workspace=ws,
+            extras={"WORKSPACE": ws, "GDPVAL_WORKSPACE": ws},
+        ),
         timeout=1800,
-        post=[DownloadHook(["/workspace", "/tmp/agent_response.txt"])],
+        post=[
+            DownloadHook(["/workspace", "/tmp/agent_response.txt"]),
+            ReadFileHook("/tmp/message.json", "message"),
+        ],
     )
 
     validate = JudgerValidator(
