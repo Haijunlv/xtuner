@@ -34,9 +34,24 @@ class GdpvalSynth:
 
     name = "gdpval-synth"
 
-    def __init__(self, tasks_root: str | Path, *, pipeline: Runner):
+    def __init__(
+        self,
+        tasks_root: str | Path,
+        *,
+        pipeline: Runner,
+        skip_ids: set[str] | list[str] | None = None,
+    ):
+        """
+        Args:
+            tasks_root (str | Path): Root dir of materialized task layout.
+            pipeline (Runner): Shared Runner for every task under this dataset.
+            skip_ids (set[str] | list[str] | None): Task ids (dir names) to exclude
+                from iteration — use for known-broken tasks so batch runs don't
+                report them as infra failures.
+        """
         self.tasks_root = Path(tasks_root).resolve()
         self.pipeline = pipeline
+        self.skip_ids = set(skip_ids or ())
 
     def iter_tasks(self) -> Iterator[tuple[Path, TaskData]]:
         """Yield ``(task_dir, TaskData)`` for every metadata.json under ``tasks_root``."""
@@ -46,10 +61,19 @@ class GdpvalSynth:
             meta_path = task_dir / "metadata.json"
             if not meta_path.exists():
                 continue
+            if self._is_skipped(task_dir.name):
+                logger.info("skipping %s (in skip_ids)", task_dir.name)
+                continue
             try:
                 yield task_dir, self.load_task(task_dir)
             except Exception as exc:
                 logger.warning("skipping %s: %s", task_dir, exc)
+
+    def _is_skipped(self, dir_name: str) -> bool:
+        for skip in self.skip_ids:
+            if dir_name == skip or dir_name.startswith(skip + "-"):
+                return True
+        return False
 
     def load_task(self, task_dir: Path) -> TaskData:
         meta = json.loads((task_dir / "metadata.json").read_text(encoding="utf-8"))
