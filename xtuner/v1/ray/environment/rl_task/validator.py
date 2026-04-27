@@ -8,16 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import logging
-from pathlib import Path
 from typing import Any, Literal
 
-from judgers import Judger
-from sandbox import exec_in, http_upload
-from schemas import AggregatedScore, JudgerResult, SandboxSpec
-
-
-logger = logging.getLogger(__name__)
+from xtuner.v1.ray.environment.rl_task.judgers import Judger
+from xtuner.v1.ray.environment.rl_task.sandbox import exec_in, http_upload
+from xtuner.v1.ray.environment.rl_task.schemas import AggregatedScore, JudgerResult, SandboxSpec
+from xtuner.v1.utils import get_logger
 
 
 class JudgerValidator:
@@ -36,7 +32,11 @@ class JudgerValidator:
         judgers: list[Judger],
         *,
         aggregator: Literal[
-            "weighted_sum", "mean", "max", "min", "all_or_nothing",
+            "weighted_sum",
+            "mean",
+            "max",
+            "min",
+            "all_or_nothing",
         ] = "weighted_sum",
         on_error: Literal["zero", "fail"] = "zero",
     ):
@@ -55,15 +55,13 @@ class JudgerValidator:
         results: list[JudgerResult] = []
         try:
             for j in self.judgers:
-                results.append(
-                    await self._run_one(j, infer_client, ctx, provider, infer_workspace, owned)
-                )
+                results.append(await self._run_one(j, infer_client, ctx, provider, infer_workspace, owned))
         finally:
             for _name, (_c, env_id) in owned.items():
                 try:
-                    await asyncio.to_thread(provider.delete, env_id)
+                    await asyncio.to_thread(_c.close)
                 except Exception as exc:
-                    logger.warning("isolated judger teardown: %s", exc)
+                    get_logger().warning(f"isolated judger teardown: {exc}")
         return self._aggregate(results)
 
     # -- internals --
@@ -79,7 +77,12 @@ class JudgerValidator:
     ) -> JudgerResult:
         try:
             client, j_workspace = await self._acquire_client(
-                j, infer_client, ctx, provider, infer_workspace, owned,
+                j,
+                infer_client,
+                ctx,
+                provider,
+                infer_workspace,
+                owned,
             )
             j_ctx = {
                 **ctx,
@@ -88,11 +91,14 @@ class JudgerValidator:
             }
             await j.stage.run(client, j_ctx)
             return j_ctx.get("judger_result") or JudgerResult(
-                judger_name=j.name, total=0.0, error="no judger_result produced",
+                judger_name=j.name,
+                total=0.0,
+                error="no judger_result produced",
             )
         except Exception as exc:
             return JudgerResult(
-                judger_name=j.name, total=0.0,
+                judger_name=j.name,
+                total=0.0,
                 error=f"{type(exc).__name__}: {exc}",
             )
 
@@ -122,17 +128,17 @@ class JudgerValidator:
         try:
             blob = await asyncio.to_thread(infer_client.download_file, infer_workspace)
             await http_upload(
-                client, f"/tmp/_ws_{j.name}.tar.gz",
+                client,
+                f"/tmp/_ws_{j.name}.tar.gz",
                 base64.b64encode(blob).decode(),
             )
             await exec_in(
                 client,
-                f"cd {ws} && tar xzf /tmp/_ws_{j.name}.tar.gz "
-                f"&& rm /tmp/_ws_{j.name}.tar.gz",
+                f"cd {ws} && tar xzf /tmp/_ws_{j.name}.tar.gz && rm /tmp/_ws_{j.name}.tar.gz",
                 raise_on_error=False,
             )
         except Exception as exc:
-            logger.warning("isolated workspace copy for %s failed: %s", j.name, exc)
+            get_logger().warning(f"isolated workspace copy for {j.name} failed: {exc}")
 
         for hook in j.on_isolated_pre:
             await hook(client, ctx)
@@ -150,10 +156,7 @@ class JudgerValidator:
             total, failed = 0.0, True
         elif self.aggregator == "weighted_sum":
             tw = sum(weights.get(r.judger_name, 1.0) for r in usable)
-            total = (
-                sum(r.total * weights.get(r.judger_name, 1.0) for r in usable) / tw
-                if tw else 0.0
-            )
+            total = sum(r.total * weights.get(r.judger_name, 1.0) for r in usable) / tw if tw else 0.0
             failed = False
         elif self.aggregator == "mean":
             total, failed = sum(r.total for r in usable) / len(usable), False

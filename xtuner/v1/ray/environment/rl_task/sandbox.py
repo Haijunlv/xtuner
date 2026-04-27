@@ -26,17 +26,15 @@ import base64
 import fnmatch
 import io
 import json
-import logging
 import os
 import re
 import tarfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-
-logger = logging.getLogger(__name__)
+from xtuner.v1.utils import get_logger
 
 
 _BUNDLE_SIZE_LOG = Path("/mnt/shared-storage-user/llmit/user/liukuikun/workspace/xtuner/work_dir/bundle_sizes.jsonl")
@@ -59,7 +57,7 @@ def _log_bundle_size(size: int, extract_root: str, file_count: int) -> None:
         with _BUNDLE_SIZE_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as exc:
-        logger.warning("bundle-size log failed: %s", exc)
+        get_logger().warning(f"bundle-size log failed: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -134,8 +132,7 @@ class UploadHook(Hook):
 
     def __init__(self, mappings: list[dict | UploadMapping]):
         self.mappings: list[UploadMapping] = [
-            m if isinstance(m, UploadMapping) else UploadMapping(**m)
-            for m in mappings
+            m if isinstance(m, UploadMapping) else UploadMapping(**m) for m in mappings
         ]
 
     async def __call__(self, client: Any, ctx: dict[str, Any]) -> None:
@@ -144,6 +141,58 @@ class UploadHook(Hook):
             files.update(_resolve_mapping(m, ctx))
         if files:
             await upload_tar_and_extract(client, files, "/")
+
+
+class ReadFileHook(Hook):
+    """Read a sandbox file and store its text content in ``ctx["pulled"]``.
+
+    Unlike :class:`DownloadHook` (which stores raw bytes and auto-detects
+    files vs dirs), this hook is intentionally simple: it reads a single
+    text file via ``exec_in`` and writes the decoded string into
+    ``ctx["pulled"][key]``.
+
+    Args:
+        path: Sandbox path to read.  May be a literal string or a
+            callable ``(ctx) -> str``.
+        key:  Key under which the content is stored in ``ctx["pulled"]``.
+            May be a literal string or a callable ``(ctx) -> str``.
+        encoding: Text encoding used to decode the file bytes.
+            Defaults to ``"utf-8"``.
+        errors: Error handler passed to ``bytes.decode``.
+            Defaults to ``"replace"``.
+        optional: When ``True`` a missing / unreadable file logs a warning
+            instead of raising.  Defaults to ``False``.
+    """
+
+    name = "read_file"
+
+    def __init__(
+        self,
+        path: Resolvable,
+        key: Resolvable,
+        *,
+        encoding: str = "utf-8",
+        errors: str = "replace",
+        optional: bool = False,
+    ):
+        self.path = path
+        self.key = key
+        self.encoding = encoding
+        self.errors = errors
+        self.optional = optional
+
+    async def __call__(self, client: Any, ctx: dict[str, Any]) -> None:
+        path = _resolve(self.path, ctx)
+        key = _resolve(self.key, ctx)
+        try:
+            blob = await asyncio.to_thread(client.download_file, path)
+            content = blob.decode(self.encoding, errors=self.errors)
+            ctx.setdefault("pulled", {})[key] = content
+        except Exception as exc:
+            if self.optional:
+                logger.warning("read_file %s (key=%r) failed: %s", path, key, exc)
+            else:
+                raise
 
 
 @dataclass
@@ -182,13 +231,25 @@ class ExecHook(Hook):
         cmd = _resolve(self.cmd, ctx)
         env = _resolve(self.env, ctx) or {}
         await exec_in(
-            client, cmd, env=env, timeout_sec=self.timeout,
+            client,
+            cmd,
+            env=env,
+            timeout_sec=self.timeout,
             raise_on_error=not self.optional,
         )
 
 
 class DownloadHook(Hook):
-    """Pull sandbox paths into ``ctx["pulled"]`` (same shape as stage pull)."""
+    """Pull sandbox paths into ``ctx["pulled"]``.
+
+    Each entry is auto-detected as file vs directory:
+      - **file** → bytes of the file (from ``/download`` endpoint)
+      - **directory** → bytes of a gzipped tar produced in-sandbox
+        (sandbox ``/download`` only serves files, so dirs are tarred first)
+
+    ``ctx["pulled"]`` is ``{path: bytes}`` in both cases; ``ctx["pulled_kinds"]``
+    records ``{path: "file" | "dir"}`` so consumers know how to interpret.
+    """
 
     name = "download"
 
@@ -198,11 +259,14 @@ class DownloadHook(Hook):
     async def __call__(self, client: Any, ctx: dict[str, Any]) -> None:
         paths = _resolve(self.paths, ctx)
         pulled = ctx.setdefault("pulled", {})
+        kinds = ctx.setdefault("pulled_kinds", {})
         for p in paths:
             try:
-                pulled[p] = await asyncio.to_thread(client.download_file, p)
+                blob, kind = await download_path(client, p)
+                pulled[p] = blob
+                kinds[p] = kind
             except Exception as exc:
-                logger.warning("download %s failed: %s", p, exc)
+                get_logger().warning(f"download {p} failed: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -211,7 +275,7 @@ class DownloadHook(Hook):
 
 
 class SandboxStage:
-    """pre-hooks → entry → post-hooks.  Each field is visible.
+    """Pre-hooks → entry → post-hooks.  Each field is visible.
 
     Not every stage needs every phase:
       - ``entry`` can be ``None`` (pure setup/teardown stage).
@@ -247,24 +311,25 @@ class SandboxStage:
         entry = _resolve(self._entry, ctx)
         if entry:
             env = _resolve(self._env, ctx) or {}
-            print(f'running entry {entry}')
             exec_res = await exec_in(
-                client, entry, env=env,
-                timeout_sec=self.timeout, raise_on_error=True,
+                client,
+                entry,
+                env=env,
+                timeout_sec=self.timeout,
+                raise_on_error=True,
             )
-            print(f'entry exec_res {exec_res}')
             rc = _result_code(exec_res)
             stdout = exec_res.get("stdout") or ""
             stderr = exec_res.get("stderr") or ""
 
         result = StageResult(
-            stdout=stdout, stderr=stderr, return_code=rc,
+            stdout=stdout,
+            stderr=stderr,
+            return_code=rc,
             pulled=ctx.get("pulled", {}),
             error=None if rc == 0 else f"return_code={rc}: {stderr[:400]}",
         )
         ctx["result"] = result
-
-        print(f'result {result}')
 
         for hook in self.post:
             await _run_hook(hook, client, ctx, phase="post")
@@ -284,12 +349,16 @@ _VAR_RE = re.compile(r"\$(\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))
 
 def _expand_vars(text: str, env: dict[str, str]) -> str:
     """Substitute ``$VAR`` / ``${VAR}`` in ``text`` using ``env`` then process
-    env.  Needed because inline ``KEY=val cmd`` doesn't expand ``$KEY``
+    env.
+
+    Needed because inline ``KEY=val cmd`` doesn't expand ``$KEY``
     within the same shell line.
     """
+
     def _sub(m: re.Match) -> str:
         name = m.group(2) or m.group(3)
         return env.get(name, os.environ.get(name, m.group(0)))
+
     return _VAR_RE.sub(_sub, text)
 
 
@@ -301,7 +370,10 @@ async def exec_in(
     env: dict[str, str] | None = None,
     raise_on_error: bool = True,
 ) -> dict[str, Any]:
-    """Execute a shell command inside the sandbox.  Raises on failure by default."""
+    """Execute a shell command inside the sandbox.
+
+    Raises on failure by default.
+    """
     if env:
         command = _expand_vars(command, env)
         prefix = " ".join(f'{k}="{v}"' for k, v in env.items())
@@ -309,10 +381,7 @@ async def exec_in(
     result = await asyncio.to_thread(client.execute, command, cwd, timeout_sec)
     rc = _result_code(result)
     if raise_on_error and rc != 0:
-        raise RuntimeError(
-            f"command failed (return_code={rc}): {command}\n"
-            f"stderr: {result.get('stderr', '')[:1000]}"
-        )
+        raise RuntimeError(f"command failed (return_code={rc}): {command}\nstderr: {result.get('stderr', '')[:1000]}")
     return result
 
 
@@ -328,7 +397,9 @@ async def http_upload(client: Any, target_path: str, content_b64: str) -> None:
 
 
 async def upload_tar_and_extract(
-    client: Any, file_map: dict[str, Path], extract_root: str,
+    client: Any,
+    file_map: dict[str, Path],
+    extract_root: str,
 ) -> None:
     if not file_map:
         return
@@ -340,6 +411,45 @@ async def upload_tar_and_extract(
         client,
         f"mkdir -p {extract_root} && cd {extract_root} && tar xzf {tmp}",
     )
+
+
+async def download_path(client: Any, remote_path: str) -> tuple[bytes, str]:
+    """Download a sandbox file or directory.
+
+    Files come back via the ``/download`` endpoint.  Directories are tarred
+    in-sandbox first (``/download`` only serves files), then the tar is
+    downloaded and the tmp tar is cleaned up.
+
+    Returns:
+        tuple[bytes, str]: ``(content, kind)`` where ``kind`` is ``"file"``
+        or ``"dir"``.  For ``"dir"`` the bytes are a gzipped tarball —
+        caller unpacks with ``tarfile.open(fileobj=io.BytesIO(content))``.
+    """
+    check = await exec_in(
+        client,
+        f'test -d "{remote_path}" && echo DIR || echo FILE',
+        raise_on_error=False,
+    )
+    is_dir = "DIR" in (check.get("stdout") or "")
+
+    if not is_dir:
+        blob = await asyncio.to_thread(client.download_file, remote_path)
+        return blob, "file"
+
+    # Tar the dir into /tmp, download, remove the tmp.
+    rp = remote_path.rstrip("/") or "/"
+    parent = rp.rsplit("/", 1)[0] or "/"
+    name = rp.rsplit("/", 1)[-1] or "root"
+    tar_remote = f"/tmp/_dl_{name}.tar.gz"
+    await exec_in(
+        client,
+        f'cd "{parent}" && tar czf {tar_remote} "{name}"',
+    )
+    try:
+        blob = await asyncio.to_thread(client.download_file, tar_remote)
+    finally:
+        await exec_in(client, f"rm -f {tar_remote}", raise_on_error=False)
+    return blob, "dir"
 
 
 def tar_dir(src: Path, arcname_prefix: str = "") -> bytes:
@@ -358,10 +468,7 @@ def walk_files(root: Path) -> list[Path]:
         return []
     if root.is_file():
         return [root]
-    return [
-        p for p in root.rglob("*")
-        if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"
-    ]
+    return [p for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"]
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -375,7 +482,7 @@ def _tar_bytes(file_map: dict[str, Path], strip_root: str) -> bytes:
         for sb_path, host_path in file_map.items():
             if not sb_path.startswith(strip_root):
                 raise ValueError(f"{sb_path} not under {strip_root}")
-            arcname = sb_path[len(strip_root):].lstrip("/")
+            arcname = sb_path[len(strip_root) :].lstrip("/")
             tar.add(host_path, arcname=arcname, recursive=False)
     return buf.getvalue()
 
@@ -388,22 +495,28 @@ def _result_code(exec_res: dict[str, Any]) -> int:
 
 
 async def _run_hook(hook: Hook, client: Any, ctx: dict[str, Any], *, phase: str) -> None:
-    """Run one hook; on failure, log + stash + re-raise with a label that
-    names the hook class so the traceback says which one blew up.
-    """
+    """Run one hook; on failure, log + stash + re-raise with a label that names
+    the hook class so the traceback says which one blew up."""
     name = getattr(hook, "name", None) or type(hook).__name__
     label = f"{phase}-hook {type(hook).__name__}({name!r})"
+    tid = (ctx.get("data") and getattr(ctx["data"], "id", None)) or "?"
+    get_logger().debug(f"[{tid}] {label} start")
+    t0 = time.monotonic()
     try:
         await hook(client, ctx)
+        get_logger().debug(f"[{tid}] {label} done ({time.monotonic() - t0:.2f}s)")
     except Exception as exc:
         import traceback as _tb
-        logger.error("%s failed: %s\n%s", label, exc, _tb.format_exc())
-        ctx.setdefault("hook_errors", []).append({
-            "phase": phase,
-            "hook": type(hook).__name__,
-            "name": name,
-            "error": f"{type(exc).__name__}: {exc}",
-        })
+
+        get_logger().error(f"[{tid}] {label} failed: {exc}\n{_tb.format_exc()}")
+        ctx.setdefault("hook_errors", []).append(
+            {
+                "phase": phase,
+                "hook": type(hook).__name__,
+                "name": name,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
         raise RuntimeError(f"{label} failed: {exc}") from exc
 
 
@@ -412,7 +525,7 @@ async def _run_hook(hook: Hook, client: Any, ctx: dict[str, Any], *, phase: str)
 # ─────────────────────────────────────────────────────────────────
 
 
-def _resolve_mapping(m: "UploadMapping", ctx: dict[str, Any]) -> dict[str, Path]:
+def _resolve_mapping(m: UploadMapping, ctx: dict[str, Any]) -> dict[str, Path]:
     # ``base`` is absolute if set and absolute; if relative, resolve against
     # ctx["task_root"]; if None, defaults to ctx["task_root"].
     if m.base is None:
@@ -458,8 +571,7 @@ def _match_source(base: Path, pattern: str) -> list[Path]:
     if pattern.startswith("re:"):
         rx = re.compile(pattern[3:])
         return sorted(
-            p for p in base.rglob("*")
-            if p.is_file() and not _ignored(p) and rx.search(p.relative_to(base).as_posix())
+            p for p in base.rglob("*") if p.is_file() and not _ignored(p) and rx.search(p.relative_to(base).as_posix())
         )
 
     if any(ch in pattern for ch in "*?["):
