@@ -7,9 +7,14 @@ export PYTHONPATH=./:/mnt/shared-storage-user/songdemin/user/haijun/code/gitlab/
 
 cd ../../
 
-
+export RL_LLM_MODEL="qwen35_35b_a3b"
+export RL_LLM_BASE_URL="http://s-20260104203038-22bhb.ailab-evalservice.pjh-service.org.cn/v1"
+ 
 python xtuner/v1/ray/environment/rl_task/runner.py \
     --config /mnt/shared-storage-user/songdemin/user/haijun/code/gitlab/claude_code/xtuner_agent_dev/xtuner/projects/gdpval_synth/configs/default.py \
     --lagent-src /mnt/shared-storage-user/songdemin/user/haijun/code/gitlab/claude_code/lagent \
     --limit 1 \
-    --concurrency 1
+    --concurrency 1 \
+    --dump-dir ./work_dir/dump \
+    --report-dir ./work_dir/reports
+    

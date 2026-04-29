@@ -26,12 +26,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import gzip
 import json
 import os
 import re
 import sys
+import tarfile
 import time
 import traceback
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +73,7 @@ class Runner:
         lagent_src_dir: str | Path | None = None,
         llm_base_url: str | None = None,
         llm_api_key: str | None = None,
+        dump_dir: Path | None = None,
     ) -> dict[str, Any]:
         """Run one rollout end-to-end.
 
@@ -122,6 +126,9 @@ class Runner:
             )
             get_logger().info(f"[{tid}] validate: done total={aggregated.total:.4f} ({time.monotonic() - t2:.1f}s)")
 
+            if dump_dir is not None:
+                _dump_pulled(dump_dir / tid, ctx.get("pulled", {}), ctx.get("pulled_kinds", {}))
+
             return _mark_completed(data, uid, metadata=_infer_metadata(ctx), judge=aggregated, infer=infer_result)
         except Exception as exc:
             get_logger().error(f"[{tid}] runner failed: {exc}\n{traceback.format_exc()}")
@@ -158,6 +165,47 @@ async def _dump_daemon_log(client) -> None:
         get_logger().error(f"agent daemon log tail:\n{data.decode(errors='replace')[-4000:]}")
     except Exception as exc:
         get_logger().warning(f"could not download daemon log: {exc}")
+
+
+def _dump_pulled(
+    out: Path,
+    pulled: dict[str, bytes],
+    kinds: dict[str, str],
+) -> None:
+    """Persist ``ctx["pulled"]`` to local disk.
+
+    - **file** entries → written as-is under ``out/<basename>``.
+    - **dir** entries (gzipped tar) → extracted into ``out/<basename>/``.
+    """
+    if not pulled:
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    for remote_path, blob in pulled.items():
+        name = Path(remote_path).name or remote_path.replace("/", "_")
+        kind = kinds.get(remote_path, "file")
+        if kind == "dir":
+            dest = out / name
+            dest.mkdir(parents=True, exist_ok=True)
+            try:
+                with tarfile.open(fileobj=BytesIO(gzip.decompress(blob))) as tf:
+                    tf.extractall(dest)
+            except Exception:
+                # Might already be a plain tar (not gzipped).
+                try:
+                    with tarfile.open(fileobj=BytesIO(blob)) as tf:
+                        tf.extractall(dest)
+                except Exception as exc:
+                    # Last resort: dump raw bytes so nothing is lost.
+                    raw = dest.with_suffix(".tar.gz")
+                    raw.write_bytes(blob)
+                    get_logger().warning(f"could not extract {remote_path}, saved raw to {raw}: {exc}")
+                    continue
+            get_logger().info(f"dumped dir {remote_path} -> {dest}")
+        else:
+            dest = out / name
+            dest.write_bytes(blob if isinstance(blob, bytes) else blob.encode("utf-8"))
+            get_logger().info(f"dumped file {remote_path} -> {dest}")
+    get_logger().info(f"sandbox artifacts saved to {out}")
 
 
 _ACQUIRE_MAX_ATTEMPTS = 3
@@ -325,6 +373,7 @@ async def _run_one(
     lagent_src_dir: str | None,
     llm_base_url: str | None,
     llm_api_key: str | None,
+    dump_dir: Path | None = None,
 ) -> dict[str, Any]:
     data = dataset.load_task(task_dir)
     runner: Runner = dataset.pipeline
@@ -337,6 +386,7 @@ async def _run_one(
         lagent_src_dir=lagent_src_dir,
         llm_base_url=llm_base_url,
         llm_api_key=llm_api_key,
+        dump_dir=dump_dir,
     )
 
 
@@ -376,6 +426,8 @@ async def main_async(args: argparse.Namespace) -> int:
     ]
     total = len(jobs)
 
+    dump_dir = Path(args.dump_dir) if args.dump_dir else None
+
     print(f"TotalTask: {total} (base={len(base_dirs)} × repeat={repeats}, concurrency={args.concurrency})")
     sem = asyncio.Semaphore(max(1, args.concurrency))
     run_start = time.monotonic()
@@ -393,6 +445,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 lagent_src_dir=lagent_src,
                 llm_base_url=args.llm_base_url,
                 llm_api_key=args.llm_api_key,
+                dump_dir=dump_dir,
             )
             nonlocal completed
             async with completed_lock:
@@ -582,6 +635,12 @@ def main() -> int:
         "--verbose",
         action="store_true",
         help="Also dump every task's full result JSON to stdout.",
+    )
+    parser.add_argument(
+        "--dump-dir",
+        default=None,
+        help="Local dir to dump sandbox artifacts (pulled files/dirs) per task. "
+        "Each task's outputs are saved under <dump-dir>/<task_id>/.",
     )
     args = parser.parse_args()
     if args.lagent_src == "":
