@@ -248,7 +248,15 @@ def try_rule_verify(
 # ─── Standalone main ─────────────────────────────────────────────────────────
 
 def _scan_deliverables(task_dir: str) -> list[str]:
-    """Scan task_dir for deliverable file paths."""
+    """Scan task_dir for deliverable file paths.
+
+    Search priority:
+      1. ``home/workspace`` / ``home`` / ``deliverable_files`` subdirs (legacy
+         layouts where the agent runs in a nested home dir).
+      2. ``task_dir`` root itself (current gdpval-synth layout — agents write
+         deliverables straight into ``$TASK_WORKSPACE``). Subdirs holding
+         input fixtures are skipped to avoid grading them as deliverables.
+    """
     deliverables: list[str] = []
     extensions = (".xlsx", ".xls", ".xlsm", ".pdf", ".pptx", ".ppt", ".docx", ".doc")
     for subdir in ("home/workspace", "home", "deliverable_files"):
@@ -259,7 +267,21 @@ def _scan_deliverables(task_dir: str) -> list[str]:
                     if fname.lower().endswith(extensions):
                         deliverables.append(os.path.join(root, fname))
             if deliverables:
-                break
+                return deliverables
+
+    # Fallback: scan task_dir root (current layout). Skip input/system dirs.
+    skip_dirs = {"reference_files", "environment", "agent", "memory", "skills",
+                 "deliverable_files", "home"}
+    if os.path.isdir(task_dir):
+        for entry in os.listdir(task_dir):
+            full = os.path.join(task_dir, entry)
+            if os.path.isfile(full) and entry.lower().endswith(extensions):
+                deliverables.append(full)
+            elif os.path.isdir(full) and entry not in skip_dirs:
+                for root, _, files in os.walk(full):
+                    for fname in files:
+                        if fname.lower().endswith(extensions):
+                            deliverables.append(os.path.join(root, fname))
     return deliverables
 
 
@@ -286,8 +308,9 @@ def main():
         # No rule criteria, output empty result
         result = {
             "judger_name": judger_name,
-            "criteria_results": [],
-            "summary": {"total": 0, "satisfied": 0, "not_satisfied": 0, "undetermined": 0},
+            "total": 0.0,
+            "criteria": {},
+            "metadata": {"summary": {"total": 0, "satisfied": 0, "not_satisfied": 0, "undetermined": 0}},
         }
         print(json.dumps(result, ensure_ascii=False))
         return
@@ -342,14 +365,28 @@ def main():
             "reason": rule_result.get("reason", ""),
         })
 
+    # Compute aggregate score: undetermined criteria are excluded from
+    # the denominator (they belong to simple_judger, not us).
+    scored = [r for r in criteria_results if r["score"] >= 0]
+    total = (sum(r["score"] for r in scored) / len(scored)) if scored else 0.0
+
+    criteria_map = {
+        r["criterion_id"]: {"score": max(0.0, r["score"])}
+        for r in criteria_results if r["score"] >= 0
+    }
+
     result = {
         "judger_name": judger_name,
-        "criteria_results": criteria_results,
-        "summary": {
-            "total": len(rule_criteria),
-            "satisfied": satisfied_count,
-            "not_satisfied": not_satisfied_count,
-            "undetermined": undetermined_count,
+        "total": total,
+        "criteria": criteria_map,
+        "metadata": {
+            "criteria_results": criteria_results,
+            "summary": {
+                "total": len(rule_criteria),
+                "satisfied": satisfied_count,
+                "not_satisfied": not_satisfied_count,
+                "undetermined": undetermined_count,
+            },
         },
     }
     print(json.dumps(result, ensure_ascii=False))

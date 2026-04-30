@@ -36,6 +36,9 @@ try:
         _scan_deliverables,
     )
 except ImportError:
+    # Standalone execution: ensure script's own dir is on sys.path so we
+    # can import the sibling rule_judge.py.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from rule_judge import (  # type: ignore[no-redef]
         Criterion,
         _to_str,
@@ -483,9 +486,12 @@ def main():
     if not sj_criteria:
         result = {
             "judger_name": judger_name,
-            "criteria_results": [],
-            "summary": {"total": 0, "yes": 0, "no": 0, "uncertain": 0, "error": 0},
-            "prompt_version": prompt_version,
+            "total": 0.0,
+            "criteria": {},
+            "metadata": {
+                "summary": {"total": 0, "yes": 0, "no": 0, "uncertain": 0, "error": 0},
+                "prompt_version": prompt_version,
+            },
         }
         print(json.dumps(result, ensure_ascii=False))
         return
@@ -557,14 +563,20 @@ def main():
             "reason": extras.get("reason", ""),
         })
 
+    # Aggregate score over all judged criteria. UNCERTAIN counts as 0.5
+    # (already mapped via score_map above), ERROR as 0.
+    total = (sum(r["score"] for r in criteria_results) / len(criteria_results)) if criteria_results else 0.0
+    criteria_map = {r["criterion_id"]: {"score": r["score"]} for r in criteria_results}
+
     result = {
         "judger_name": judger_name,
-        "criteria_results": criteria_results,
-        "summary": {
-            "total": len(sj_criteria),
-            **stats,
+        "total": total,
+        "criteria": criteria_map,
+        "metadata": {
+            "criteria_results": criteria_results,
+            "summary": {"total": len(sj_criteria), **stats},
+            "prompt_version": prompt_version,
         },
-        "prompt_version": prompt_version,
     }
     print(json.dumps(result, ensure_ascii=False))
 

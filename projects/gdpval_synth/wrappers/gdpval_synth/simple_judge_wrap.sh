@@ -6,6 +6,6 @@ set -uo pipefail
 WRAPPER_DIR="$(dirname "$0")"
 
 # Ensure dependencies
-pip install -q openpyxl python-docx 2>/dev/null || true
+pip install -q --break-system-packages openpyxl python-docx pdfplumber python-pptx
 
-/mnt/llm-ai-infra/miniconda3/envs/train/bin/python3 "$WRAPPER_DIR/simple_judge.py"
+python3 "$WRAPPER_DIR/simple_judge.py"
