@@ -45,7 +45,7 @@ if _HERE not in sys.path:
 
 from lagent.serving.sandbox.providers.gateway import GatewayProvider  # noqa: E402
 
-from xtuner.v1.ray.environment.rl_task.sandbox import SandboxStage  # noqa: E402
+from xtuner.v1.ray.environment.rl_task.sandbox import SandboxStage, download_path  # noqa: E402
 from xtuner.v1.ray.environment.rl_task.schemas import TaskData  # noqa: E402
 from xtuner.v1.ray.environment.rl_task.validator import JudgerValidator  # noqa: E402
 from xtuner.v1.utils import get_logger
@@ -127,7 +127,16 @@ class Runner:
             get_logger().info(f"[{tid}] validate: done total={aggregated.total:.4f} ({time.monotonic() - t2:.1f}s)")
 
             if dump_dir is not None:
-                _dump_pulled(dump_dir / tid, ctx.get("pulled", {}), ctx.get("pulled_kinds", {}))
+                _dump_pulled(dump_dir / tid / "infer", ctx.get("pulled", {}), ctx.get("pulled_kinds", {}))
+                # Also dump workspace after validate (includes python_test, rubric, etc.)
+                try:
+                    ws_path = self.infer.sandbox.workspace_path
+                    blob, kind = await download_path(client, ws_path)
+                    post_validate_pulled = {ws_path: blob}
+                    post_validate_kinds = {ws_path: kind}
+                    _dump_pulled(dump_dir / tid / "validate", post_validate_pulled, post_validate_kinds)
+                except Exception as exc:
+                    get_logger().warning(f"[{tid}] post-validate dump failed: {exc}")
 
             return _mark_completed(data, uid, metadata=_infer_metadata(ctx), judge=aggregated, infer=infer_result)
         except Exception as exc:
@@ -235,7 +244,9 @@ async def _acquire_ready_sandbox(provider: Any, spec: Any) -> tuple[Any, str]:
             )
         except Exception as exc:
             last_err = exc
-            get_logger().warning(f"provider.create attempt {attempt} failed: {exc}")
+            get_logger().warning(
+                f"provider.create attempt {attempt} failed: {type(exc).__name__}: {exc!r}"
+            )
             await asyncio.sleep(min(2**attempt, 8))
             continue
 
@@ -434,6 +445,11 @@ async def main_async(args: argparse.Namespace) -> int:
     completed = 0
     completed_lock = asyncio.Lock()
 
+    # Stream results as they complete: each task's full JSON is written to
+    # an individual file immediately and optionally printed to stdout.
+    stream_dir = Path(args.report_dir) / "stream"
+    stream_dir.mkdir(parents=True, exist_ok=True)
+
     async def _guarded(job_idx: int, td: Path, uid: dict[str, int]) -> dict[str, Any]:
         async with sem:
             started = time.monotonic()
@@ -460,12 +476,18 @@ async def main_async(args: argparse.Namespace) -> int:
                     f"[{completed}/{total}] {tid} {state} took={took:.1f}s | "
                     f"elapsed={int(elapsed)}s eta={int(remaining)}s (rate={rate:.1f}/s)"
                 )
+                # ── stream: dump this task's result immediately ──
+                result_json = json.dumps(result, ensure_ascii=False, indent=2, default=str)
+                safe_tid = str(tid).replace("/", "_")
+                stream_file = stream_dir / f"{safe_tid}.json"
+                stream_file.write_text(result_json, encoding="utf-8")
+                get_logger().info(f"[stream] {tid} -> {stream_file}")
+                if args.verbose:
+                    print(result_json, flush=True)
             return result
 
     results = await asyncio.gather(*[_guarded(i, td, uid) for i, (td, uid) in enumerate(jobs)])
-    if args.verbose:
-        for r in results:
-            print(json.dumps(r, ensure_ascii=False, indent=2, default=str))
+    # verbose 汇总已在上面逐条打印，这里不再重复
 
     report_path = _write_run_report(results, Path(args.report_dir))
     _print_summary(results, report_path)

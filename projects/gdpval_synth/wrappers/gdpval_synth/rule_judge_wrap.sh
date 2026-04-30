@@ -6,6 +6,6 @@ set -uo pipefail
 WRAPPER_DIR="$(dirname "$0")"
 
 # Ensure dependencies
-pip install -q --break-system-packages openpyxl python-docx pdfplumber python-pptx
+pip install -q --break-system-packages openpyxl python-docx pdfplumber python-pptx PyMuPDF
 
 python3 "$WRAPPER_DIR/rule_judge.py"

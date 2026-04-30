@@ -4,6 +4,6 @@ from gdpval_synth.dataset import GdpvalSynth
 from gdpval_synth.pipeline import gdpval_synth_pipeline
 
 dataset = GdpvalSynth(
-    tasks_root="/mnt/shared-storage-user/songdemin/user/haijun/code/gitlab/claude_code/dataset/gdpval_synth_v2/phase5_llm_verify/outputv1_glm5/rl_query_extract_dedup/xtuner_rl_data_demo",
+    tasks_root="/mnt/shared-storage-user/songdemin/user/haijun/code/gitlab/claude_code/dataset/gdpval_synth_v2/phase5_llm_verify/outputv1_glm5/rl_query_extract_dedup/xtuner_rl_data_python_rubrics_output_v2",
     pipeline=gdpval_synth_pipeline(),
 )

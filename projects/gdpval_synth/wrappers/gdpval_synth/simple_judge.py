@@ -36,9 +36,6 @@ try:
         _scan_deliverables,
     )
 except ImportError:
-    # Standalone execution: ensure script's own dir is on sys.path so we
-    # can import the sibling rule_judge.py.
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from rule_judge import (  # type: ignore[no-redef]
         Criterion,
         _to_str,
@@ -484,15 +481,7 @@ def main():
     # Filter simple_judge criteria
     sj_criteria = [c for c in raw_criteria if c.get("judge_method") == "simple_judge"]
     if not sj_criteria:
-        result = {
-            "judger_name": judger_name,
-            "total": 0.0,
-            "criteria": {},
-            "metadata": {
-                "summary": {"total": 0, "yes": 0, "no": 0, "uncertain": 0, "error": 0},
-                "prompt_version": prompt_version,
-            },
-        }
+        result = {"judger_name": judger_name, "total": 0.0, "criteria": {}}
         print(json.dumps(result, ensure_ascii=False))
         return
 
@@ -523,8 +512,8 @@ def main():
     file_summary = "\n\n".join(summaries)[:30000]
 
     # Judge each criterion
-    criteria_results = []
-    stats = {"yes": 0, "no": 0, "uncertain": 0, "error": 0}
+    criteria: dict[str, dict] = {}
+    scores: list[float] = []
 
     for i, c in enumerate(sj_criteria):
         cid = c.get("criterion_id", f"c_{i}")
@@ -549,34 +538,19 @@ def main():
         # Score mapping
         score_map = {"YES": 1.0, "NO": 0.0, "UNCERTAIN": 0.5, "ERROR": 0.0}
         score = score_map.get(result_str, 0.0)
+        weight = float(c.get("weight", 1))
 
-        stats_key = result_str.lower()
-        if stats_key in stats:
-            stats[stats_key] += 1
+        criteria[cid] = {"score": score, "weight": weight}
+        scores.append(score * weight)
 
-        criteria_results.append({
-            "criterion_id": cid,
-            "score": score,
-            "result": result_str,
-            "satisfied": result_str == "YES",
-            "evidence": extras.get("evidence", ""),
-            "reason": extras.get("reason", ""),
-        })
-
-    # Aggregate score over all judged criteria. UNCERTAIN counts as 0.5
-    # (already mapped via score_map above), ERROR as 0.
-    total = (sum(r["score"] for r in criteria_results) / len(criteria_results)) if criteria_results else 0.0
-    criteria_map = {r["criterion_id"]: {"score": r["score"]} for r in criteria_results}
+    total_weight = sum(float(c.get("weight", 1)) for c in sj_criteria)
+    total = sum(scores) / total_weight if total_weight > 0 else 0.0
 
     result = {
         "judger_name": judger_name,
-        "total": total,
-        "criteria": criteria_map,
-        "metadata": {
-            "criteria_results": criteria_results,
-            "summary": {"total": len(sj_criteria), **stats},
-            "prompt_version": prompt_version,
-        },
+        "total": round(total, 4),
+        "criteria": criteria,
+        "metadata": {"prompt_version": prompt_version},
     }
     print(json.dumps(result, ensure_ascii=False))
 

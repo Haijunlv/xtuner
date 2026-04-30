@@ -5,7 +5,7 @@ set -uo pipefail
 
 WRAPPER_DIR="$(dirname "$0")"
 
-# Ensure dependencies
+# Ensure dependencies (python_test scripts may use any of these)
 pip install -q --break-system-packages openpyxl python-docx pdfplumber python-pptx PyMuPDF
 
-python3 "$WRAPPER_DIR/simple_judge.py"
+python3 "$WRAPPER_DIR/extractor_judge.py"
